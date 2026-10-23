@@ -63,7 +63,8 @@ enum {
 	avr_timer_wgm_ctc,
 	avr_timer_wgm_pwm,
 	avr_timer_wgm_fast_pwm,
-	avr_timer_wgm_fc_pwm,
+	avr_timer_wgm_fc_pwm,	// phase correct PWM with a fixed TOP (0xFF, 0x1FF, 0x3FF)
+	avr_timer_wgm_pfc_pwm,	// phase and frequency correct PWM (OCR updated at BOTTOM)
 };
 
 // Compare output modes
@@ -105,6 +106,8 @@ typedef struct avr_timer_wgm_t {
 #define AVR_TIMER_WGM_FCPWM10() { .kind = avr_timer_wgm_fc_pwm, .size=10 }
 #define AVR_TIMER_WGM_OCPWM() { .kind = avr_timer_wgm_pwm, .top = avr_timer_wgm_reg_ocra }
 #define AVR_TIMER_WGM_ICPWM() { .kind = avr_timer_wgm_pwm, .top = avr_timer_wgm_reg_icr }
+#define AVR_TIMER_WGM_OCPFCPWM() { .kind = avr_timer_wgm_pfc_pwm, .top = avr_timer_wgm_reg_ocra }
+#define AVR_TIMER_WGM_ICPFCPWM() { .kind = avr_timer_wgm_pfc_pwm, .top = avr_timer_wgm_reg_icr }
 #define AVR_TIMER_WGM_ICFASTPWM() { .kind = avr_timer_wgm_fast_pwm, .top = avr_timer_wgm_reg_icr }
 #define AVR_TIMER_WGM_OCFASTPWM() { .kind = avr_timer_wgm_fast_pwm, .top = avr_timer_wgm_reg_ocra }
 
@@ -120,9 +123,10 @@ typedef struct avr_timer_wgm_t {
 		[5] = AVR_TIMER_WGM_FASTPWM8(),	\
 		[6] = AVR_TIMER_WGM_FASTPWM9(),	\
 		[7] = AVR_TIMER_WGM_FASTPWM10(),\
-		[8] = AVR_TIMER_WGM_ICPWM(),	\
-		[9] = AVR_TIMER_WGM_OCPWM(),	\
-		/* TODO: 8, 9 PWM phase and freq correct ICR and OCRA1. */  \
+		[8] = AVR_TIMER_WGM_ICPFCPWM(),	\
+		[9] = AVR_TIMER_WGM_OCPFCPWM(),	\
+		[10] = AVR_TIMER_WGM_ICPWM(),	\
+		[11] = AVR_TIMER_WGM_OCPWM(),	\
 		[12] = AVR_TIMER_WGM_ICCTC(),	\
 		[14] = AVR_TIMER_WGM_ICFASTPWM(),\
 		[15] = AVR_TIMER_WGM_OCFASTPWM(),\
@@ -206,6 +210,16 @@ typedef struct avr_timer_t {
 	float			phase_accumulator;
 	uint64_t		tov_base;	// MCU cycle when the last overflow occured; when clocked externally holds external clock count
 	uint16_t		tov_top;	// current top value to calculate tnct
+
+	// Dual-slope PWM (phase correct, phase and frequency correct) on the internal clock,
+	// see avr_timer_dual_event().
+	struct {
+		uint8_t		active;
+		uint16_t	top;		// TOP of the current period
+		uint16_t	top_next;	// TOP latched at TOP, used from the next BOTTOM
+		uint16_t	ocr[AVR_TIMER_COMP_COUNT];	// double-buffered OCRnx in use
+		uint64_t	bottom;		// MCU cycle of the current period's BOTTOM
+	} dual;
 } avr_timer_t;
 
 void avr_timer_init(avr_t * avr, avr_timer_t * port);

@@ -135,6 +135,7 @@ avr_timer_comp_on_tov(
 
 	// only PWM modes have special behaviour on overflow
 	if((p->wgm_op_mode_kind != avr_timer_wgm_pwm) &&
+	   (p->wgm_op_mode_kind != avr_timer_wgm_pfc_pwm) &&
 	   (p->wgm_op_mode_kind != avr_timer_wgm_fast_pwm))
 		return;
 
@@ -177,6 +178,263 @@ avr_timer_compc(
 		void * param)
 {
 	return avr_timer_comp((avr_timer_t*)param, when, AVR_TIMER_COMPC, 1);
+}
+
+/*
+ * Dual-slope PWM: phase correct and phase and frequency correct modes, internal clock.
+ *
+ * The counter runs BOTTOM -> TOP -> BOTTOM, so one period is 2 * TOP timer clocks. With
+ * COMnx = 2 (non-inverting), OCnx is cleared on the compare match while counting up and set
+ * on the compare match while counting down; COMnx = 3 inverts that. TOVn is set at BOTTOM.
+ * OCRnx (and OCRnA when it defines TOP) are double-buffered: the new value is used from TOP
+ * in phase correct modes and from BOTTOM in phase and frequency correct modes, which is also
+ * when OCFnA or ICFn is set if that register defines TOP. OCRnx = BOTTOM gives a constant low
+ * output and OCRnx = TOP a constant high one (non-inverting). COMnA = 1 toggles OCnA on
+ * compare match where OCRnA or ICRn defines TOP. See for example the ATmega328P datasheet,
+ * sections 15.7.4 (Timer0), 16.9.4-16.9.5 (Timer1) and 18.7.4 (Timer2).
+ *
+ * Instead of the single-slope overflow and compare timers, one cycle timer steps through the
+ * events of each period in order: compare matches up, TOP, compare matches down, BOTTOM.
+ * Clocked externally (Tn pin, asynchronous AS2), these modes keep the existing tick-by-tick
+ * handling in avr_timer_irq_ext_clock().
+ */
+
+static avr_cycle_count_t
+avr_timer_dual_event(
+		struct avr_t * avr,
+		avr_cycle_count_t when,
+		void * param);
+
+static int
+avr_timer_is_dual_slope(
+		avr_timer_t * p)
+{
+	return p->wgm_op_mode_kind == avr_timer_wgm_pwm ||
+			p->wgm_op_mode_kind == avr_timer_wgm_fc_pwm ||
+			p->wgm_op_mode_kind == avr_timer_wgm_pfc_pwm;
+}
+
+static int
+avr_timer_uses_internal_clock(
+		avr_timer_t * p)
+{
+	return !(p->ext_clock_flags & (AVR_TIMER_EXTCLK_FLAG_TN | AVR_TIMER_EXTCLK_FLAG_AS2));
+}
+
+/* The register value that defines TOP in the current mode. */
+static uint16_t
+avr_timer_dual_top_register(
+		avr_timer_t * p)
+{
+	uint16_t top;
+	switch (p->mode.top) {
+		case avr_timer_wgm_reg_ocra:
+			top = _timer_get_ocr(p, AVR_TIMER_COMPA);
+			break;
+		case avr_timer_wgm_reg_icr:
+			top = _timer_get_icr(p);
+			break;
+		default:
+			top = p->wgm_op_mode_size;
+			break;
+	}
+	return top ? top : 1;	// TOP = 0 would make an empty period
+}
+
+static void
+avr_timer_dual_latch_ocr(
+		avr_timer_t * p)
+{
+	for (int compi = 0; compi < AVR_TIMER_COMP_COUNT; compi++)
+		p->dual.ocr[compi] = p->comp[compi].r_ocr ? _timer_get_ocr(p, compi) : 0;
+}
+
+/* Comparator compi defines TOP (OCRnA in modes with OCRnA as TOP): it has no PWM output. */
+static int
+avr_timer_dual_is_top_comp(
+		avr_timer_t * p,
+		int compi)
+{
+	return compi == AVR_TIMER_COMPA && p->mode.top == avr_timer_wgm_reg_ocra;
+}
+
+static void
+avr_timer_dual_set_output(
+		avr_timer_t * p,
+		int compi,
+		int level)
+{
+	avr_irq_t * irq = &p->io.irq[TIMER_IRQ_OUT_COMP + compi];
+	uint32_t flags = p->comp[compi].com_pin.reg ? AVR_IOPORT_OUTPUT : 0;
+
+	if (level < 0)		// toggle
+		level = p->comp[compi].com_pin.reg ?
+				!avr_regbit_get(p->io.avr, p->comp[compi].com_pin) : !irq->value;
+	avr_raise_irq(irq, flags | (level ? 1 : 0));
+}
+
+/* A compare match of comparator compi, while counting up (up = 1) or down. */
+static void
+avr_timer_dual_match(
+		avr_timer_t * p,
+		int compi,
+		int up)
+{
+	avr_t * avr = p->io.avr;
+	uint8_t com = avr_regbit_get(avr, p->comp[compi].com);
+	uint16_t ocr = p->dual.ocr[compi];
+
+	avr_raise_interrupt(avr, &p->comp[compi].interrupt);
+
+	switch (com) {
+		case avr_timer_com_toggle:
+			// Only OCnA, and only in modes where OCRnA or ICRn defines TOP.
+			if (compi == AVR_TIMER_COMPA && p->mode.top != avr_timer_wgm_reg_constant)
+				avr_timer_dual_set_output(p, compi, -1);
+			break;
+		case avr_timer_com_clear:	// non-inverting
+		case avr_timer_com_set: {	// inverting
+			int level = up ? 0 : 1;
+			if (ocr == 0)
+				level = 0;			// OCRnx = BOTTOM: constant low
+			else if (ocr >= p->dual.top)
+				level = 1;			// OCRnx = TOP: constant high
+			if (com == avr_timer_com_set)
+				level = !level;
+			avr_timer_dual_set_output(p, compi, level);
+		}	break;
+		default:
+			break;
+	}
+}
+
+/* The next event tick (timer clocks after BOTTOM) after tick t; 2 * TOP is the next BOTTOM. */
+static uint32_t
+avr_timer_dual_next(
+		avr_timer_t * p,
+		uint32_t t)
+{
+	uint32_t top = p->dual.top;
+	uint32_t next = 2 * top;
+
+	if (t < top)
+		next = top;
+	for (int compi = 0; compi < AVR_TIMER_COMP_COUNT; compi++) {
+		if (!p->comp[compi].r_ocr || avr_timer_dual_is_top_comp(p, compi))
+			continue;
+		uint32_t ocr = p->dual.ocr[compi];
+		if (ocr == 0 || ocr >= top)
+			continue;	// matches at BOTTOM or TOP, which are events anyway
+		if (ocr > t && ocr < next)
+			next = ocr;
+		if (2 * top - ocr > t && 2 * top - ocr < next)
+			next = 2 * top - ocr;
+	}
+	return next;
+}
+
+static avr_cycle_count_t
+avr_timer_dual_event(
+		struct avr_t * avr,
+		avr_cycle_count_t when,
+		void * param)
+{
+	avr_timer_t * p = (avr_timer_t *)param;
+	uint32_t prescaler = p->cs_div_value;
+	uint32_t t = (uint32_t)((when - p->dual.bottom) / prescaler);
+	int pfc = p->wgm_op_mode_kind == avr_timer_wgm_pfc_pwm;
+
+	if (t >= 2u * p->dual.top) {		// BOTTOM: a new period starts
+		p->dual.bottom += 2ull * p->dual.top * prescaler;
+		t = 0;
+		if (pfc) {
+			avr_timer_dual_latch_ocr(p);
+			p->dual.top = avr_timer_dual_top_register(p);
+			if (p->mode.top == avr_timer_wgm_reg_ocra)
+				avr_raise_interrupt(avr, &p->comp[AVR_TIMER_COMPA].interrupt);
+			else if (p->mode.top == avr_timer_wgm_reg_icr)
+				avr_raise_interrupt(avr, &p->icr);
+		} else {
+			p->dual.top = p->dual.top_next;
+		}
+		p->tov_top = p->dual.top;
+		avr_raise_interrupt(avr, &p->overflow);
+	}
+
+	if (t == p->dual.top) {			// TOP
+		if (!pfc) {
+			avr_timer_dual_latch_ocr(p);
+			p->dual.top_next = avr_timer_dual_top_register(p);
+			if (p->mode.top == avr_timer_wgm_reg_ocra)
+				avr_raise_interrupt(avr, &p->comp[AVR_TIMER_COMPA].interrupt);
+			else if (p->mode.top == avr_timer_wgm_reg_icr)
+				avr_raise_interrupt(avr, &p->icr);
+		}
+		// OCnA toggles on its match at TOP when OCRnA defines TOP (COMnA = 1).
+		if (p->mode.top == avr_timer_wgm_reg_ocra &&
+				avr_regbit_get(avr, p->comp[AVR_TIMER_COMPA].com) == avr_timer_com_toggle)
+			avr_timer_dual_set_output(p, AVR_TIMER_COMPA, -1);
+	}
+
+	for (int compi = 0; compi < AVR_TIMER_COMP_COUNT; compi++) {
+		if (!p->comp[compi].r_ocr || avr_timer_dual_is_top_comp(p, compi))
+			continue;
+		uint32_t ocr = p->dual.ocr[compi], top = p->dual.top;
+		if (ocr == 0) {
+			if (t == 0)
+				avr_timer_dual_match(p, compi, 1);
+		} else if (ocr == top) {
+			if (t == top)
+				avr_timer_dual_match(p, compi, 1);
+		} else if (ocr < top) {
+			if (t == ocr)
+				avr_timer_dual_match(p, compi, 1);
+			if (t == 2 * top - ocr)
+				avr_timer_dual_match(p, compi, 0);
+		}	// OCRnx > TOP: never matches
+	}
+
+	return p->dual.bottom + (avr_cycle_count_t)avr_timer_dual_next(p, t) * prescaler;
+}
+
+/* Starts the dual-slope sequence with the counter at `tcnt`, counting up. */
+static void
+avr_timer_dual_start(
+		avr_timer_t * p,
+		uint16_t tcnt)
+{
+	avr_t * avr = p->io.avr;
+	uint32_t prescaler = p->cs_div_value;
+
+	avr_cycle_timer_cancel(avr, avr_timer_dual_event, p);
+	if (!prescaler)
+		return;
+	avr_timer_dual_latch_ocr(p);
+	p->dual.top = p->dual.top_next = avr_timer_dual_top_register(p);
+	if (tcnt > p->dual.top)
+		tcnt = p->dual.top;
+	p->dual.bottom = avr->cycle - (avr_cycle_count_t)tcnt * prescaler;
+	p->dual.active = 1;
+	p->tov_top = p->dual.top;
+	p->tov_cycles = 0;	// the single-slope overflow timer is not used
+
+	// Handle what happens at the starting count (a constant output for OCRnx = BOTTOM),
+	// then schedule the next event.
+	avr_cycle_count_t next = avr_timer_dual_event(avr, p->dual.bottom + (avr_cycle_count_t)tcnt * prescaler, p);
+	avr_cycle_timer_register(avr, next - avr->cycle, avr_timer_dual_event, p);
+}
+
+static uint16_t
+avr_timer_dual_tcnt(
+		avr_timer_t * p)
+{
+	uint32_t t = (uint32_t)((p->io.avr->cycle - p->dual.bottom) / p->cs_div_value);
+	uint32_t top = p->dual.top;
+	if (t <= top)
+		return t;				// counting up
+	if (t < 2 * top)
+		return 2 * top - t;		// counting down
+	return 0;
 }
 
 static void
@@ -235,6 +493,7 @@ avr_timer_irq_ext_clock(
 	switch (p->wgm_op_mode_kind) {
 		case avr_timer_wgm_fc_pwm:	// in the avr_timer_write_ocr comment "OCR is not used here" - why?
 		case avr_timer_wgm_pwm:
+		case avr_timer_wgm_pfc_pwm:
 			if ((p->ext_clock_flags & AVR_TIMER_EXTCLK_FLAG_REVDIR) != 0) {
 				--p->tov_base;
 				if (p->tov_base == 0) {
@@ -343,6 +602,8 @@ _avr_timer_get_current_tcnt(
 		avr_timer_t * p)
 {
 	avr_t * avr = p->io.avr;
+	if (p->dual.active)
+		return avr_timer_dual_tcnt(p);
 	if (!(p->ext_clock_flags & (AVR_TIMER_EXTCLK_FLAG_TN | AVR_TIMER_EXTCLK_FLAG_AS2)) ||
 			(p->ext_clock_flags & AVR_TIMER_EXTCLK_FLAG_VIRT)
 			) {
@@ -387,9 +648,11 @@ avr_timer_cancel_all_cycle_timers(
 		for (int compi = 0; compi < AVR_TIMER_COMP_COUNT; compi++)
 			timer->comp[compi].comp_cycles = 0;
 		timer->tov_cycles = 0;
+		timer->dual.active = 0;
 	}
 
 
+	avr_cycle_timer_cancel(avr, avr_timer_dual_event, timer);
 	avr_cycle_timer_cancel(avr, avr_timer_tov, timer);
 	avr_cycle_timer_cancel(avr, avr_timer_compa, timer);
 	avr_cycle_timer_cancel(avr, avr_timer_compb, timer);
@@ -407,6 +670,11 @@ avr_timer_tcnt_write(
 	avr_core_watch_write(avr, addr, v);
 	uint16_t tcnt = _timer_get_tcnt(p);
 
+	if (p->dual.active) {
+		// Continue from the new count, counting up.
+		avr_timer_dual_start(p, tcnt);
+		return;
+	}
 	if (!p->tov_top)
 		return;
 
@@ -441,6 +709,29 @@ avr_timer_tcnt_write(
 	else {
 		// clocked externally
 		p->tov_base = tcnt;
+	}
+}
+
+/* Listens to the Tn input pin when the timer counts its edges, and stops listening otherwise. */
+static void
+avr_timer_connect_ext_clock_pin(
+		avr_timer_t * p,
+		int connect)
+{
+	avr_ioport_getirq_t req = {
+		.bit = p->ext_clock_pin
+	};
+	if (avr_ioctl(p->io.avr, AVR_IOCTL_IOPORT_GETIRQ_REGBIT, &req) > 0) {
+		// got an IRQ for the Tn input clock pin
+		if (connect) {
+			if (p->trace)
+				AVR_LOG(p->io.avr, LOG_TRACE, "%s: timer%c connecting T%c pin IRQ %d\n", __FUNCTION__, p->name, p->name, req.irq[0]->irq);
+			avr_irq_register_notify(req.irq[0], avr_timer_irq_ext_clock, p);
+		} else {
+			if (p->trace)
+				AVR_LOG(p->io.avr, LOG_TRACE, "%s: timer%c disconnecting T%c pin IRQ %d\n", __FUNCTION__, p->name, p->name, req.irq[0]->irq);
+			avr_irq_unregister_notify(req.irq[0], avr_timer_irq_ext_clock, p);
+		}
 	}
 }
 
@@ -549,24 +840,8 @@ avr_timer_configure(
 			p->tov_base = 0;
 	}
 
-	if (reset) {
-		avr_ioport_getirq_t req = {
-			.bit = p->ext_clock_pin
-		};
-		if (avr_ioctl(p->io.avr, AVR_IOCTL_IOPORT_GETIRQ_REGBIT, &req) > 0) {
-			// got an IRQ for the Tn input clock pin
-			if (use_ext_clock && !virt_ext_clock) {
-				if (p->trace)
-					AVR_LOG(p->io.avr, LOG_TRACE, "%s: timer%c connecting T%c pin IRQ %d\n", __FUNCTION__, p->name, p->name, req.irq[0]->irq);
-				avr_irq_register_notify(req.irq[0], avr_timer_irq_ext_clock, p);
-			} else {
-				if (p->trace)
-					AVR_LOG(p->io.avr, LOG_TRACE, "%s: timer%c disconnecting T%c pin IRQ %d\n", __FUNCTION__, p->name, p->name, req.irq[0]->irq);
-				avr_irq_unregister_notify(req.irq[0], avr_timer_irq_ext_clock, p);
-			}
-		}
-	}
-
+	if (reset)
+		avr_timer_connect_ext_clock_pin(p, use_ext_clock && !virt_ext_clock);
 }
 
 static void
@@ -574,9 +849,17 @@ avr_timer_reconfigure(
 		avr_timer_t * p, uint8_t reset)
 {
 	avr_t * avr = p->io.avr;
+	uint16_t dual_tcnt = p->dual.active ? avr_timer_dual_tcnt(p) : 0;
 
 	// cancel everything
 	avr_timer_cancel_all_cycle_timers(avr, p, 1);
+
+	if (avr_timer_is_dual_slope(p) && avr_timer_uses_internal_clock(p)) {
+		if (reset)
+			avr_timer_connect_ext_clock_pin(p, 0);
+		avr_timer_dual_start(p, reset ? 0 : dual_tcnt);
+		return;
+	}
 
 	switch (p->wgm_op_mode_kind) {
 		case avr_timer_wgm_normal:
@@ -588,6 +871,7 @@ avr_timer_reconfigure(
 		case avr_timer_wgm_ctc: {
 			avr_timer_configure(p, p->cs_div_value, _timer_get_ocr(p, AVR_TIMER_COMPA), reset);
 		}	break;
+		case avr_timer_wgm_pfc_pwm:	// clocked externally: same as phase correct
 		case avr_timer_wgm_pwm: {
 			uint16_t top = (p->mode.top == avr_timer_wgm_reg_ocra) ?
 				_timer_get_ocr(p, AVR_TIMER_COMPA) : _timer_get_icr(p);
@@ -625,6 +909,16 @@ avr_timer_write_ocr(
 	oldv = _timer_get_comp_ocr(avr, comp);
 	avr_core_watch_write(avr, addr, v);
 
+	if (timer->dual.active) {
+		// Dual-slope PWM: OCRnx is double-buffered and picked up at TOP or BOTTOM by
+		// avr_timer_dual_event(); nothing to reschedule now.
+		avr_raise_irq(timer->io.irq + TIMER_IRQ_OUT_PWM0, _timer_get_ocr(timer, AVR_TIMER_COMPA));
+		avr_raise_irq(timer->io.irq + TIMER_IRQ_OUT_PWM1, _timer_get_ocr(timer, AVR_TIMER_COMPB));
+		if (sizeof(timer->comp)>2)
+			avr_raise_irq(timer->io.irq + TIMER_IRQ_OUT_PWM2, _timer_get_ocr(timer, AVR_TIMER_COMPC));
+		return;
+	}
+
 	switch (timer->wgm_op_mode_kind) {
 		case avr_timer_wgm_normal:
 			avr_timer_reconfigure(timer, 0);
@@ -635,6 +929,7 @@ avr_timer_write_ocr(
 		case avr_timer_wgm_ctc:
 			avr_timer_reconfigure(timer, 0);
 			break;
+		case avr_timer_wgm_pfc_pwm:
 		case avr_timer_wgm_pwm:
 			if (timer->mode.top != avr_timer_wgm_reg_ocra) {
 				avr_raise_irq(timer->io.irq + TIMER_IRQ_OUT_PWM0, _timer_get_ocr(timer, AVR_TIMER_COMPA));
@@ -856,6 +1151,7 @@ avr_timer_reset(
 {
 	avr_timer_t * p = (avr_timer_t *)port;
 	avr_timer_cancel_all_cycle_timers(p->io.avr, p, 0);
+	p->dual.active = 0;
 
 	// check to see if the comparators have a pin output. If they do,
 	// (try) to get the ioport corresponding IRQ and connect them
