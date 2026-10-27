@@ -552,6 +552,23 @@ avr_timer_irq_ext_clock(
 
 }
 
+/*
+ * Fast PWM with OCRnx = TOP and COMnx = 2 or 3: the datasheet's special case ("the Compare
+ * Match is ignored, but the set or clear is done at BOTTOM"), so the output is constant: high
+ * when non-inverting, low when inverting. The compare flag is still set at TOP. Without this,
+ * the match was handled after the BOTTOM update, giving the opposite constant level.
+ */
+static int
+avr_timer_fast_pwm_at_top(
+		avr_timer_t *p,
+		uint8_t comp)
+{
+	uint8_t mode = avr_regbit_get(p->io.avr, p->comp[comp].com);
+	return p->wgm_op_mode_kind == avr_timer_wgm_fast_pwm &&
+		p->comp[comp].comp_cycles == p->tov_cycles &&
+		(mode == avr_timer_com_clear || mode == avr_timer_com_set);
+}
+
 // timer overflow
 static avr_cycle_count_t
 avr_timer_tov(
@@ -589,6 +606,10 @@ avr_timer_tov(
 				avr_cycle_timer_register(avr,
 					p->comp[compi].comp_cycles - (avr->cycle - next),
 					dispatch[compi], p);
+			} else if (avr_timer_fast_pwm_at_top(p, compi)) {
+				if (!start)
+					avr_raise_interrupt(avr, &p->comp[compi].interrupt);
+				avr_timer_comp_on_tov(p, when, compi);
 			} else if (p->tov_cycles == p->comp[compi].comp_cycles && !start)
 				dispatch[compi](avr, when, param);
 		}
